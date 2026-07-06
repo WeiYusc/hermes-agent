@@ -155,6 +155,17 @@ _MIN_SUMMARY_TOKENS = 2000
 _SUMMARY_RATIO = 0.20
 # Absolute ceiling for summary tokens (even on very large context windows)
 _SUMMARY_TOKENS_CEILING = 12_000
+# Hard cap for the serialized conversation excerpt sent to the auxiliary
+# summarizer. Per-message truncation is not enough when the compressed middle
+# contains hundreds of tool results; without a global cap the summary request can
+# still be so large that the auxiliary call times out before producing a
+# checkpoint. 120k chars is roughly 30k tokens before the template overhead,
+# leaving room for the structured prompt on common 64k+ auxiliary models.
+_SUMMARY_INPUT_CHAR_CEILING = 120_000
+_SUMMARY_INPUT_OMISSION_MARKER = (
+    "[... {count} earlier compacted turn(s) omitted from summarizer input "
+    "to stay within the auxiliary model budget ...]"
+)
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -1333,50 +1344,117 @@ class ContextCompressor(ContextEngine):
         (API keys, tokens, passwords) from leaking into the summary that
         gets sent to the auxiliary model and persisted across compactions.
         """
-        parts = []
-        for msg in turns:
-            role = msg.get("role", "unknown")
-            content = redact_sensitive_text(msg.get("content") or "")
-            content = _MEDIA_DIRECTIVE_RE.sub("[media attachment]", content)
+        return self._serialize_for_summary_with_budget(
+            turns,
+            max_chars=_SUMMARY_INPUT_CHAR_CEILING,
+        )
 
-            # Tool results: keep enough content for the summarizer
-            if role == "tool":
-                tool_id = msg.get("tool_call_id", "")
-                if len(content) > self._CONTENT_MAX:
-                    content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
-                parts.append(f"[TOOL RESULT {tool_id}]: {content}")
-                continue
+    def _serialize_turn_for_summary(self, msg: Dict[str, Any]) -> str:
+        """Serialize one message for the summarizer, with per-field bounds."""
+        role = msg.get("role", "unknown")
+        content = redact_sensitive_text(msg.get("content") or "")
+        content = _MEDIA_DIRECTIVE_RE.sub("[media attachment]", content)
 
-            # Assistant messages: include tool call names AND arguments
-            if role == "assistant":
-                if len(content) > self._CONTENT_MAX:
-                    content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
-                tool_calls = msg.get("tool_calls", [])
-                if tool_calls:
-                    tc_parts = []
-                    for tc in tool_calls:
-                        if isinstance(tc, dict):
-                            fn = tc.get("function", {})
-                            name = fn.get("name", "?")
-                            args = redact_sensitive_text(fn.get("arguments", ""))
-                            # Truncate long arguments but keep enough for context
-                            if len(args) > self._TOOL_ARGS_MAX:
-                                args = args[:self._TOOL_ARGS_HEAD] + "..."
-                            tc_parts.append(f"  {name}({args})")
-                        else:
-                            fn = getattr(tc, "function", None)
-                            name = getattr(fn, "name", "?") if fn else "?"
-                            tc_parts.append(f"  {name}(...)")
-                    content += "\n[Tool calls:\n" + "\n".join(tc_parts) + "\n]"
-                parts.append(f"[ASSISTANT]: {content}")
-                continue
-
-            # User and other roles
+        # Tool results: keep enough content for the summarizer
+        if role == "tool":
+            tool_id = msg.get("tool_call_id", "")
             if len(content) > self._CONTENT_MAX:
                 content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
-            parts.append(f"[{role.upper()}]: {content}")
+            return f"[TOOL RESULT {tool_id}]: {content}"
 
-        return "\n\n".join(parts)
+        # Assistant messages: include tool call names AND arguments
+        if role == "assistant":
+            if len(content) > self._CONTENT_MAX:
+                content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+            tool_calls = msg.get("tool_calls", [])
+            if tool_calls:
+                tc_parts = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        fn = tc.get("function", {})
+                        name = fn.get("name", "?")
+                        args = redact_sensitive_text(fn.get("arguments", ""))
+                        # Truncate long arguments but keep enough for context
+                        if len(args) > self._TOOL_ARGS_MAX:
+                            args = args[:self._TOOL_ARGS_HEAD] + "..."
+                        tc_parts.append(f"  {name}({args})")
+                    else:
+                        fn = getattr(tc, "function", None)
+                        name = getattr(fn, "name", "?") if fn else "?"
+                        tc_parts.append(f"  {name}(...)")
+                content += "\n[Tool calls:\n" + "\n".join(tc_parts) + "\n]"
+            return f"[ASSISTANT]: {content}"
+
+        # User and other roles
+        if len(content) > self._CONTENT_MAX:
+            content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+        return f"[{role.upper()}]: {content}"
+
+    def _serialize_for_summary_with_budget(
+        self,
+        turns: List[Dict[str, Any]],
+        *,
+        max_chars: int | None,
+    ) -> str:
+        """Serialize turns while enforcing a global summarizer-input budget.
+
+        Per-message limits bound individual huge tool outputs, but a long
+        session may contain hundreds of already-pruned tool messages. Preserve
+        recency by keeping the newest serialized turns that fit, and insert a
+        visible omission marker so the summary model knows older source turns
+        were intentionally omitted rather than absent.
+        """
+        serialized = [self._serialize_turn_for_summary(msg) for msg in turns]
+        if not max_chars or max_chars <= 0:
+            return "\n\n".join(serialized)
+
+        sep = "\n\n"
+        kept_reversed: list[str] = []
+        used = 0
+        omitted = 0
+        for item in reversed(serialized):
+            extra = len(item) + (len(sep) if kept_reversed else 0)
+            if kept_reversed and used + extra > max_chars:
+                # Preserve a contiguous newest suffix. Once an older turn cannot
+                # fit ahead of the already-kept newer turns, all remaining older
+                # turns are omitted too; otherwise the marker would claim only
+                # "earlier" turns were omitted while silently skipping a more
+                # recent intervening turn.
+                omitted += 1
+                break
+            if not kept_reversed and len(item) > max_chars:
+                # A single serialized turn can still exceed the global budget if
+                # constants change. Keep its head with an explicit marker rather
+                # than returning an empty prompt.
+                marker = _SUMMARY_INPUT_OMISSION_MARKER.format(count=1)
+                head_budget = max(0, max_chars - len(marker) - len(sep))
+                kept_reversed.append(item[:head_budget].rstrip() + sep + marker)
+                used = len(kept_reversed[0])
+                break
+            if used + extra <= max_chars:
+                kept_reversed.append(item)
+                used += extra
+            else:
+                omitted += 1
+                break
+
+        if omitted:
+            omitted = max(omitted, len(serialized) - len(kept_reversed))
+
+        kept = list(reversed(kept_reversed))
+        if omitted:
+            marker = _SUMMARY_INPUT_OMISSION_MARKER.format(count=omitted)
+            candidate = [marker, *kept]
+            text = sep.join(candidate)
+            if len(text) > max_chars and kept:
+                # Make room for the marker by dropping the oldest kept turns;
+                # recency is more valuable than silently losing the omission
+                # signal.
+                while kept and len(sep.join([marker, *kept])) > max_chars:
+                    kept.pop(0)
+                text = sep.join([marker, *kept]) if kept else marker[:max_chars]
+            return text
+        return sep.join(kept)
 
     def _build_static_fallback_summary(
         self,
