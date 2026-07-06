@@ -536,7 +536,30 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
             cmd = cmd[:77] + "..."
         exit_match = re.search(r'"exit_code"\s*:\s*(-?\d+)', content)
         exit_code = exit_match.group(1) if exit_match else "?"
-        return f"[terminal] ran `{cmd}` -> exit {exit_code}, {line_count} lines output"
+        summary = f"[terminal] ran `{cmd}` -> exit {exit_code}, {line_count} lines output"
+        if exit_code not in {"0", "?"}:
+            # Preserve one actionable failure clue when pruning old terminal
+            # output. A bare "exit 1, 400 lines" forces the later summary model
+            # to guess what failed; the last non-empty output/error line is often
+            # enough to retain the blocker while still removing the large body.
+            tail_line = ""
+            try:
+                parsed = json.loads(content)
+                raw_output = parsed.get("output", "")
+                raw_error = parsed.get("error", "")
+                text = "\n".join(str(x) for x in (raw_output, raw_error) if x)
+            except (ValueError, TypeError, AttributeError):
+                text = content
+            for line in reversed(str(text).splitlines()):
+                stripped = line.strip()
+                if stripped:
+                    tail_line = redact_sensitive_text(stripped)
+                    break
+            if tail_line:
+                if len(tail_line) > 180:
+                    tail_line = tail_line[:177].rstrip() + "..."
+                summary += f"; last: {tail_line}"
+        return summary
 
     if tool_name == "read_file":
         path = args.get("path", "?")

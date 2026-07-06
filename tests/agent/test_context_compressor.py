@@ -9,6 +9,7 @@ from agent.context_compressor import (
     HISTORICAL_TASK_HEADING,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
+    _summarize_tool_result,
 )
 from hermes_state import SessionDB
 
@@ -2845,6 +2846,31 @@ class TestTruncateToolCallArgsJson:
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
         assert parsed["content"].endswith("...[truncated]")
+
+
+class TestToolResultSummary:
+    def test_terminal_failure_summary_preserves_last_failure_line(self):
+        content = '{"output": "installing\\nFAILED tests/test_api.py::test_login - AssertionError", "exit_code": 1, "error": null}'
+
+        summary = _summarize_tool_result(
+            "terminal",
+            '{"command": "pytest tests"}',
+            content,
+        )
+
+        assert "exit 1" in summary
+        assert "last: FAILED tests/test_api.py::test_login - AssertionError" in summary
+
+    def test_terminal_success_summary_does_not_include_tail_noise(self):
+        content = '{"output": "line1\\nline2", "exit_code": 0, "error": null}'
+
+        summary = _summarize_tool_result(
+            "terminal",
+            '{"command": "pytest tests"}',
+            content,
+        )
+
+        assert summary == "[terminal] ran `pytest tests` -> exit 0, 1 lines output"
 
 
 class TestPreflightSentinelGuard:
