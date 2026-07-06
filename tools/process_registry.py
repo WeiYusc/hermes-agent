@@ -1905,26 +1905,67 @@ def _format_age(seconds: float) -> str:
     return f"{h}h" if m == 0 else f"{h}h{m}m"
 
 
-def _format_async_delegation(evt: dict) -> str:
-    """Format an async-delegation completion into a self-contained re-injection.
+_ASYNC_DELEGATION_CONTEXT_MAX_CHARS = 4_000
+_ASYNC_DELEGATION_SUMMARY_MAX_CHARS = 24_000
 
-    Carries the FULL original task source (goal, the context the parent
-    supplied, toolsets, role, model) plus dispatch time, status, and the
-    complete result summary. When this re-enters the conversation the agent
-    may be deep in unrelated context and won't remember why the subagent
-    existed, so the block is written to stand entirely on its own — enough to
-    use the result OR re-dispatch if the world has moved on.
+
+def _truncate_async_delegation_field(value: object, *, max_chars: int) -> str:
+    """Bound async-delegation reinjection fields while preserving head+tail.
+
+    Completion notices are stored back into the parent conversation. Large
+    review contexts or subagent summaries can otherwise be re-injected verbatim
+    and then repeatedly re-summarized, which is one source of long-context
+    compression pressure. Keep both ends: the head usually identifies the task,
+    the tail often carries the final verdict/JSON.
+    """
+    text = "" if value is None else str(value)
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    marker_template = "\n...[truncated {count:,} chars from async delegation notice]...\n"
+    # First estimate with the full-over-budget count, then recompute the marker
+    # after head/tail sizes are known so the number reflects actual payload
+    # characters omitted (not marker overhead).
+    marker = marker_template.format(count=max(0, len(text) - max_chars))
+    if max_chars <= len(marker) + 2:
+        return text[:max_chars]
+    head = max(1, int((max_chars - len(marker)) * 0.45))
+    tail = max(1, max_chars - len(marker) - head)
+    omitted = max(0, len(text) - head - tail)
+    marker = marker_template.format(count=omitted)
+    if len(marker) + head + tail > max_chars:
+        # Marker digit growth can rarely push the result over budget; trim the
+        # tail because the head identifies the task source.
+        tail = max(1, max_chars - len(marker) - head)
+        omitted = max(0, len(text) - head - tail)
+        marker = marker_template.format(count=omitted)
+    return text[:head].rstrip() + marker + text[-tail:].lstrip()
+
+
+def _format_async_delegation(evt: dict) -> str:
+    """Format an async-delegation completion into a bounded re-injection.
+
+    Carries the original task source (goal, bounded context, toolsets, role,
+    model) plus dispatch time, status, and a bounded result summary. When this
+    re-enters the conversation the agent may be deep in unrelated context and
+    won't remember why the subagent existed, so the block remains self-contained
+    while avoiding unbounded replay of large review prompts/results.
     """
     import time as _time
 
     deleg_id = evt.get("delegation_id", "unknown")
     goal = evt.get("goal", "") or ""
-    context = evt.get("context")
+    context = _truncate_async_delegation_field(
+        evt.get("context"),
+        max_chars=_ASYNC_DELEGATION_CONTEXT_MAX_CHARS,
+    )
     toolsets = evt.get("toolsets")
     role = evt.get("role") or "leaf"
     model = evt.get("model") or "?"
     status = evt.get("status") or "completed"
-    summary = evt.get("summary")
+    summary = _truncate_async_delegation_field(
+        evt.get("summary"),
+        max_chars=_ASYNC_DELEGATION_SUMMARY_MAX_CHARS,
+    )
     error = evt.get("error")
     api_calls = evt.get("api_calls", 0)
     duration = evt.get("duration_seconds", "?")
@@ -1965,7 +2006,10 @@ def _format_async_delegation(evt: dict) -> str:
         for r in sorted(results, key=lambda x: x.get("task_index", 0)):
             idx = r.get("task_index", 0)
             r_status = r.get("status", "?")
-            r_summary = r.get("summary")
+            r_summary = _truncate_async_delegation_field(
+                r.get("summary"),
+                max_chars=_ASYNC_DELEGATION_SUMMARY_MAX_CHARS,
+            )
             r_error = r.get("error")
             r_goal = goals[idx] if idx < len(goals) else r.get("goal", "")
             icon = "✓" if r_status in ("completed", "success") else "✗"
@@ -2002,7 +2046,7 @@ def _format_async_delegation(evt: dict) -> str:
     lines = [
         f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
         "A background subagent you dispatched earlier has finished. You may "
-        "have moved on since dispatching it; the full task source is below so "
+        "have moved on since dispatching it; the bounded task source is below so "
         "you can act on the result or re-dispatch if things have changed.",
         "",
     ]

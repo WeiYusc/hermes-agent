@@ -569,6 +569,73 @@ def test_gateway_formatter_renders_async_block():
     assert "Investigate flaky test" in txt
 
 
+def test_rich_reinjection_block_bounds_large_context_and_summary():
+    from tools.process_registry import (
+        _ASYNC_DELEGATION_CONTEXT_MAX_CHARS,
+        _ASYNC_DELEGATION_SUMMARY_MAX_CHARS,
+    )
+
+    long_context = "CTX_HEAD " + ("c" * (_ASYNC_DELEGATION_CONTEXT_MAX_CHARS + 500)) + " CTX_TAIL"
+    long_summary = "SUMMARY_HEAD " + ("s" * (_ASYNC_DELEGATION_SUMMARY_MAX_CHARS + 500)) + " SUMMARY_TAIL"
+
+    text = format_process_notification(_make_async_evt(context=long_context, summary=long_summary))
+
+    assert text is not None
+    assert "CTX_HEAD" in text
+    assert "CTX_TAIL" in text
+    assert "SUMMARY_HEAD" in text
+    assert "SUMMARY_TAIL" in text
+    assert "truncated" in text
+    assert len(text) < len(long_context) + len(long_summary)
+
+
+def test_batch_reinjection_bounds_large_context_and_child_summaries():
+    from tools.process_registry import (
+        _ASYNC_DELEGATION_CONTEXT_MAX_CHARS,
+        _ASYNC_DELEGATION_SUMMARY_MAX_CHARS,
+    )
+
+    long_context = "BCTX_HEAD " + ("c" * (_ASYNC_DELEGATION_CONTEXT_MAX_CHARS + 500)) + " BCTX_TAIL"
+    long_summary = "BSUM_HEAD " + ("s" * (_ASYNC_DELEGATION_SUMMARY_MAX_CHARS + 500)) + " BSUM_TAIL"
+    evt = _make_async_evt(
+        is_batch=True,
+        context=long_context,
+        goals=["review"],
+        results=[{
+            "task_index": 0,
+            "status": "completed",
+            "summary": long_summary,
+            "api_calls": 3,
+            "duration_seconds": 1.2,
+        }],
+        summary=None,
+    )
+
+    text = format_process_notification(evt)
+
+    assert text is not None
+    assert "ASYNC DELEGATION BATCH COMPLETE" in text
+    assert "BCTX_HEAD" in text
+    assert "BCTX_TAIL" in text
+    assert "BSUM_HEAD" in text
+    assert "BSUM_TAIL" in text
+    assert "truncated" in text
+    assert len(text) < len(long_context) + len(long_summary)
+
+
+def test_async_delegation_truncation_marker_reports_actual_omitted_chars():
+    from tools.process_registry import _truncate_async_delegation_field
+
+    text = "H" * 120 + "T" * 120
+    out = _truncate_async_delegation_field(text, max_chars=120)
+
+    assert len(out) <= 120
+    assert "truncated" in out
+    reported = int(out.split("truncated ", 1)[1].split(" chars", 1)[0].replace(",", ""))
+    preserved_payload = len(out.split("\n...[truncated", 1)[0]) + len(out.rsplit("]...\n", 1)[1])
+    assert reported == len(text) - preserved_payload
+
+
 def test_gateway_watch_drain_requeues_async_without_looping():
     from gateway.run import _drain_gateway_watch_events
 
