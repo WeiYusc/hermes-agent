@@ -227,6 +227,17 @@ def _non_conversational_metadata(
     return merged
 
 
+def _adapter_supports_gateway_streaming(adapter: Any) -> bool:
+    """Return True when the adapter can safely own gateway streaming delivery."""
+    if adapter is None:
+        return False
+    if bool(getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)):
+        return True
+    return bool(getattr(adapter, "SUPPORTS_NATIVE_STREAMING_REPLIES", False)) and callable(
+        getattr(adapter, "send_stream_chunk", None)
+    )
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -13488,6 +13499,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reply_to_message_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build the metadata dict platforms need for thread-aware replies."""
+        if (
+            getattr(source, "platform", None) == Platform.WECOM
+            and reply_to_message_id is not None
+        ):
+            # WeCom native reply streaming needs the provider reply context in
+            # metadata. Keep this separate from generic thread metadata: it is
+            # only a callback-bound reply anchor, not permission to reroute to
+            # a private/DM fallback target.
+            return {"reply": {"msgid": str(reply_to_message_id)}}
         return self._thread_metadata_for_target(
             getattr(source, "platform", None),
             getattr(source, "chat_id", None),
@@ -15629,7 +15649,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                 _adapter = self.adapters.get(source.platform)
-                if _adapter:
+                if _adapter and _adapter_supports_gateway_streaming(_adapter):
                     _pause_typing_before_finalize = None
                     if source.platform == Platform.TELEGRAM and hasattr(_adapter, "pause_typing_for_chat"):
                         def _pause_typing_before_finalize(
@@ -15637,7 +15657,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _chat_id=source.chat_id,
                         ) -> None:
                             _adapter.pause_typing_for_chat(_chat_id)
-                    _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
+                    _adapter_supports_edit = bool(getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True))
                     _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
                     _buffer_only = False
                     if source.platform == Platform.MATRIX:
@@ -16707,7 +16727,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "reply_to_message_id": event_message_id,
             }
         else:
-            _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+            _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -16835,7 +16855,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
-                    if _adapter:
+                    if _adapter and _adapter_supports_gateway_streaming(_adapter):
                         _pause_typing_before_finalize = None
                         if source.platform == Platform.TELEGRAM and hasattr(_adapter, "pause_typing_for_chat"):
                             def _pause_typing_before_finalize(
@@ -16843,15 +16863,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _chat_id=source.chat_id,
                             ) -> None:
                                 _adapter.pause_typing_for_chat(_chat_id)
-                        # Platforms that don't support editing sent messages
-                        # (e.g. QQ, WeChat) should skip streaming entirely —
-                        # without edit support, the consumer sends a partial
-                        # first message that can never be updated, resulting in
-                        # duplicate messages (partial + final).
-                        _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                        if not _adapter_supports_edit:
-                            raise RuntimeError("skip streaming for non-editable platform")
-                        _effective_cursor = _scfg.cursor
+                        _adapter_supports_edit = bool(getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True))
+                        _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
                         # Some Matrix clients render the streaming cursor
                         # as a visible tofu/white-box artifact.  Keep
                         # streaming text on Matrix, but suppress the cursor.

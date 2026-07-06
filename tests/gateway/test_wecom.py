@@ -5,6 +5,7 @@ import base64
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -894,6 +895,35 @@ class TestWeComZombieSessionFix:
         adapter._send_request.assert_awaited_once()
         cmd = adapter._send_request.await_args.args[0]
         assert cmd == APP_CMD_SEND
+
+    @pytest.mark.asyncio
+    async def test_native_stream_overflow_failure_reports_delivered_overflow_prefix(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.MAX_MESSAGE_LENGTH = 10
+        adapter._reply_req_ids["origin-msg-1"] = "reply-req-1"
+        adapter._send_reply_request = AsyncMock(
+            side_effect=[
+                {"errcode": 0, "body": {"stream": {"stream_id": "stream-1"}}},
+                {"errcode": 0, "headers": {"req_id": "overflow-1"}},
+                {"errcode": 600039, "errmsg": "second overflow failed"},
+            ]
+        )
+
+        result = await adapter.send_stream_chunk(
+            chat_id="chat-123",
+            content=("A" * 10) + ("B" * 10) + ("C" * 10),
+            reply_to="origin-msg-1",
+            stream_key="stream-key-1",
+            finalize=True,
+        )
+
+        assert result.success is False
+        assert result.raw_response["confirmed_prefix_len"] == 20
+        assert result.raw_response["overflow_error"]
+        assert adapter._stream_state("stream-key-1") is None
+        assert adapter._send_reply_request.await_count == 3
 
 
 
