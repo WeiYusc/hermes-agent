@@ -114,6 +114,9 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Preflight compression aborted and preserved the transcript.  The caller
+    # should stop this turn cleanly instead of continuing with oversized context.
+    compression_abort_message: str = ""
 
 
 def build_turn_context(
@@ -413,6 +416,8 @@ def build_turn_context(
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
                 )
+                if getattr(agent, "_last_compression_abort_should_stop", False):
+                    break
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens
                 ):
@@ -503,4 +508,9 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        compression_abort_message=(
+            getattr(agent, "_last_compression_abort_message", "")
+            if getattr(agent, "_last_compression_abort_should_stop", False)
+            else ""
+        ),
     )

@@ -597,6 +597,20 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    if _ctx.compression_abort_message:
+        _final_response = _ctx.compression_abort_message
+        agent._persist_session(messages, conversation_history)
+        return {
+            "final_response": _final_response,
+            "messages": messages,
+            "completed": False,
+            "api_calls": 0,
+            "error": "context compression aborted",
+            "partial": True,
+            "failed": True,
+            "compression_aborted": True,
+        }
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
@@ -608,6 +622,24 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+
+    def _compression_abort_result() -> Dict[str, Any]:
+        _final_response = getattr(
+            agent,
+            "_last_compression_abort_message",
+            "⚠ Compression aborted. No messages were dropped; please /compress or retry from the recovery checkpoint.",
+        )
+        agent._persist_session(messages, conversation_history)
+        return {
+            "final_response": _final_response,
+            "messages": messages,
+            "completed": False,
+            "api_calls": api_call_count,
+            "error": "context compression aborted",
+            "partial": True,
+            "failed": True,
+            "compression_aborted": True,
+        }
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -3015,6 +3047,8 @@ def run_conversation(
                             approx_tokens=approx_tokens,
                             task_id=effective_task_id,
                         )
+                        if getattr(agent, "_last_compression_abort_should_stop", False):
+                            return _compression_abort_result()
                         conversation_history = conversation_history_after_compression(
                             agent, messages
                         )
@@ -3260,6 +3294,8 @@ def run_conversation(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
                     )
+                    if getattr(agent, "_last_compression_abort_should_stop", False):
+                        return _compression_abort_result()
                     conversation_history = conversation_history_after_compression(
                         agent, messages
                     )
@@ -3483,6 +3519,8 @@ def run_conversation(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
                     )
+                    if getattr(agent, "_last_compression_abort_should_stop", False):
+                        return _compression_abort_result()
                     conversation_history = conversation_history_after_compression(
                         agent, messages
                     )
@@ -4616,6 +4654,8 @@ def run_conversation(
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
                     )
+                    if getattr(agent, "_last_compression_abort_should_stop", False):
+                        return _compression_abort_result()
                     conversation_history = conversation_history_after_compression(
                         agent, messages
                     )

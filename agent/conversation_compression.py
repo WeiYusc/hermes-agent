@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 import uuid
 import threading
@@ -52,6 +53,168 @@ COMPACTION_STATUS = (
 )
 
 
+def _content_to_text(value: Any, *, limit: int = 2000) -> str:
+    """Best-effort bounded text extraction for checkpoint diagnostics."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                elif item.get("type") in {"image_url", "input_image"}:
+                    parts.append("[image]")
+                else:
+                    parts.append(str(item)[:200])
+            else:
+                parts.append(str(item)[:200])
+        text = "\n".join(p for p in parts if p)
+    else:
+        text = str(value)
+    if len(text) > limit:
+        return text[:limit].rstrip() + "…[truncated]"
+    return text
+
+
+def _extract_checkpoint_paths(text: str) -> list[str]:
+    """Extract likely recovery anchors without trying to interpret secrets."""
+    if not text:
+        return []
+    patterns = [
+        r"/(?:www|root|usr|var|opt|tmp|home)/[^\s`'\"<>]+",
+        r"https?://[^\s`'\"<>]+",
+        r"\b(?:\d{1,3}\.){3}\d{1,3}\b(?::\d+)?",
+    ]
+    seen: set[str] = set()
+    out: list[str] = []
+    for pat in patterns:
+        for match in re.findall(pat, text):
+            item = match.rstrip(".,);]")
+            if item and item not in seen:
+                seen.add(item)
+                out.append(item)
+            if len(out) >= 30:
+                return out
+    return out
+
+
+def _write_compression_abort_checkpoint(agent: Any, messages: list[dict], err: str) -> str | None:
+    """Write a deterministic, redacted recovery checkpoint after compression abort.
+
+    This deliberately does not call an LLM.  It records bounded recovery anchors
+    so a resumed/manual-compressed session can rediscover worklogs, skills, repo
+    paths, hosts, and the last few turns without preserving secret values.
+    """
+    try:
+        from agent.redact import redact_sensitive_text
+    except Exception:  # pragma: no cover - redaction module is expected in runtime
+        redact_sensitive_text = lambda s: s  # type: ignore
+
+    def _redact(text: Any) -> str:
+        try:
+            redacted = redact_sensitive_text(str(text or ""), force=True)
+        except TypeError:
+            redacted = redact_sensitive_text(str(text or ""))
+        # Checkpoint files are a hard safety boundary.  The general redactor
+        # intentionally avoids masking short values in some contexts to reduce
+        # false positives, but recovery checkpoints must never preserve raw
+        # credential-looking assignments from user/tool text.
+        redacted = re.sub(
+            r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key)\s*[:=]\s*([^\s`'\"<>]+)",
+            lambda m: f"{m.group(1)}=[REDACTED]",
+            redacted,
+        )
+        return redacted
+
+    try:
+        base = Path(os.environ.get("HERMES_HOME") or "/www/.hermes") / "recovery"
+        base.mkdir(parents=True, exist_ok=True)
+        sid = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(getattr(agent, "session_id", "session") or "session"))[:80]
+        stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        path = base / f"compression-abort-{sid}-{stamp}.md"
+
+        recent = messages[-12:]
+        lines: list[str] = [
+            f"# Compression abort checkpoint — {stamp}",
+            "",
+            "## Failure",
+            f"- reason: `{_redact(err or 'unknown')}`",
+            f"- session_id: `{_redact(getattr(agent, 'session_id', '') or '')}`",
+            f"- platform: `{_redact(getattr(agent, 'platform', '') or '')}`",
+            f"- model: `{_redact(getattr(agent, 'model', '') or '')}`",
+            "- messages_preserved: true",
+            "",
+            "## Recovery instructions",
+            "- Read this checkpoint, then inspect any listed worklogs/skills before resuming.",
+            "- Credential values are intentionally redacted; use the listed locations or prior worklogs to rediscover them.",
+            "- Do not infer success from this checkpoint; verify the live source/system state.",
+            "",
+            "## Recent messages",
+        ]
+
+        combined_text_parts: list[str] = []
+        for idx, msg in enumerate(recent, 1):
+            role = msg.get("role", "unknown")
+            text = _content_to_text(msg.get("content"), limit=1200)
+            combined_text_parts.append(text)
+            lines.append(f"### {idx}. {role}")
+            lines.append("")
+            lines.append("```text")
+            lines.append(_redact(text))
+            lines.append("```")
+            tool_calls = msg.get("tool_calls") or []
+            if tool_calls:
+                lines.append("Tool calls:")
+                for call in tool_calls[:8]:
+                    fn = call.get("function", {}) if isinstance(call, dict) else {}
+                    name = (fn.get("name") or call.get("name") or "unknown") if isinstance(call, dict) else "unknown"
+                    args = _content_to_text(fn.get("arguments", ""), limit=500)
+                    combined_text_parts.append(args)
+                    lines.append(f"- `{_redact(name)}` args: `{_redact(args)}`")
+            lines.append("")
+
+        combined = "\n".join(combined_text_parts)
+        anchors = _extract_checkpoint_paths(combined)
+        lines.extend(["## Detected recovery anchors", ""])
+        if anchors:
+            for item in anchors:
+                lines.append(f"- `{_redact(item)}`")
+        else:
+            lines.append("- (none detected)")
+        lines.append("")
+
+        try:
+            todo_snapshot = agent._todo_store.format_for_injection()
+        except Exception:
+            todo_snapshot = ""
+        if todo_snapshot:
+            lines.extend(["## Todo snapshot", "", "```text", _redact(todo_snapshot[:4000]), "```", ""])
+
+        path.write_text("\n".join(lines), encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except Exception:
+            pass
+        return str(path)
+    except Exception as exc:
+        logger.debug("failed to write compression abort checkpoint: %s", exc, exc_info=True)
+        return None
+
+
+def _compression_abort_user_message(err: str, checkpoint_path: str | None) -> str:
+    checkpoint = f"\n\nRecovery checkpoint: `{checkpoint_path}`" if checkpoint_path else ""
+    return (
+        f"⚠ Compression aborted: {err or 'unknown error'}.\n\n"
+        "No messages were dropped; the conversation state was preserved. "
+        "To avoid continuing a long turn with an oversized context and hitting the chat platform's update window, I paused here. "
+        "Run `/compress` or reply “继续” and I will first read the recovery checkpoint/worklogs/skills before resuming."
+        f"{checkpoint}"
+    )
+
+
 def _compression_lock_holder(agent: Any) -> str:
     """Build a unique holder id for the lock: pid:tid:agent-instance:uuid.
 
@@ -70,6 +233,48 @@ def _compression_lock_holder(agent: Any) -> str:
         f":agent={id(agent):x}"
         f":nonce={uuid.uuid4().hex[:8]}"
     )
+
+
+class _CompressionActivityHeartbeat:
+    """Refresh the agent inactivity tracker while compression blocks in an aux call."""
+
+    def __init__(self, agent: Any, interval_seconds: float | None = None) -> None:
+        self._agent = agent
+        if interval_seconds is None:
+            interval_seconds = float(
+                getattr(agent, "_compression_activity_heartbeat_interval", 60.0)
+                or 60.0
+            )
+        self._interval_seconds = max(0.1, float(interval_seconds))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="compression-activity-heartbeat",
+            daemon=True,
+        )
+
+    def start(self) -> "_CompressionActivityHeartbeat":
+        self._touch("context compression started")
+        self._thread.start()
+        return self
+
+    def stop(self, desc: str = "context compression completed") -> None:
+        self._stop.set()
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=1.0)
+        self._touch(desc)
+
+    def _touch(self, desc: str) -> None:
+        try:
+            touch = getattr(self._agent, "_touch_activity", None)
+            if callable(touch):
+                touch(desc)
+        except Exception:
+            logger.debug("compression activity heartbeat touch failed", exc_info=True)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            self._touch("context compression in progress")
 
 
 class _CompressionLockLeaseRefresher:
@@ -579,21 +784,25 @@ def compress_context(
         except Exception:
             pass
 
+    _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = _CompressionActivityHeartbeat(agent).start()
     try:
-        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
-    except TypeError:
-        # Plugin context engine with strict signature that doesn't accept
-        # focus_topic / force — fall back to calling without them.
         try:
+            compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
+        except TypeError:
+            # Plugin context engine with strict signature that doesn't accept
+            # focus_topic / force — fall back to calling without them.
             compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens)
-        except BaseException:
-            _release_lock()
-            raise
     except BaseException:
         # ANY exception during compress() must release the lock so the
         # session isn't permanently blocked from future compression.
+        if _activity_heartbeat is not None:
+            _activity_heartbeat.stop("context compression failed")
+            _activity_heartbeat = None
         _release_lock()
         raise
+    finally:
+        if _activity_heartbeat is not None:
+            _activity_heartbeat.stop("context compression completed")
 
     # If compression aborted (aux LLM failed to produce a usable summary)
     # the compressor returns the input messages unchanged.  Surface the
@@ -603,12 +812,22 @@ def compress_context(
     if getattr(agent.context_compressor, "_last_compress_aborted", False):
         try:
             _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
+            _checkpoint_path = _write_compression_abort_checkpoint(agent, messages, _err)
+            agent._last_compression_abort_checkpoint = _checkpoint_path
+            agent._last_compression_abort_should_stop = True
+            agent._last_compression_abort_message = _compression_abort_user_message(_err, _checkpoint_path)
             if getattr(agent, "_last_compression_summary_warning", None) != _err:
                 agent._last_compression_summary_warning = _err
                 agent._emit_warning(
                     f"⚠ Compression aborted: {_err}. "
                     "No messages were dropped — conversation continues unchanged. "
-                    "Run /compress to retry, or /new to start a fresh session."
+                    "I will pause this turn to avoid continuing with an oversized context. "
+                    "Run /compress or reply '继续' to resume."
+                )
+            if _checkpoint_path:
+                logger.warning(
+                    "compression aborted for session=%s; recovery checkpoint written to %s",
+                    agent.session_id or "none", _checkpoint_path,
                 )
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:

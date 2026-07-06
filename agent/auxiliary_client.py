@@ -6333,6 +6333,22 @@ def call_llm(
                         resolved_provider, task, reason=reason)
 
             if fb_client is not None:
+                if task == "compression" and _is_timeout_error(first_err):
+                    _orig_base = str(getattr(client, "base_url", "") or resolved_base_url or "").rstrip("/")
+                    _fb_base = str(getattr(fb_client, "base_url", "") or "").rstrip("/")
+                    _orig_model = str(final_model or "")
+                    _fb_model = str(fb_model or "")
+                    if _orig_base == _fb_base and _orig_model == _fb_model:
+                        logger.warning(
+                            "Auxiliary compression: skipping fallback after timeout because it resolves "
+                            "to the same endpoint/model (provider=%s model=%s base_url=%s)",
+                            fb_label or resolved_provider or "auto",
+                            _fb_model or "unknown",
+                            _fb_base or "default",
+                        )
+                        fb_client = None
+
+            if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
                     fb_label, fb_model, messages,
                     temperature=temperature, max_tokens=max_tokens,

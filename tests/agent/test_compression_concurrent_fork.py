@@ -93,6 +93,62 @@ def _count_children(db: SessionDB, parent_sid: str) -> int:
     return len(rows)
 
 
+def test_compression_activity_heartbeat_touches_agent_during_long_compress(tmp_path: Path) -> None:
+    """Long compression must refresh agent activity so gateway watchdogs do not fire."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "HEARTBEAT_TEST"
+    db.create_session(session_id, source="wecom")
+
+    agent = _build_agent_with_db(db, session_id)
+    agent._compression_activity_heartbeat_interval = 0.05
+    touch_calls: list[str] = []
+    agent._touch_activity = lambda desc: touch_calls.append(desc)
+
+    def _slow_compress(*_a, **_kw):
+        time.sleep(0.16)
+        return [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": "tail"},
+        ]
+
+    agent.context_compressor.compress.side_effect = _slow_compress
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+    agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+    assert touch_calls[0] == "context compression started"
+    assert "context compression in progress" in touch_calls
+    assert touch_calls[-1] == "context compression completed"
+    assert db.get_compression_lock_holder(session_id) is None
+
+
+def test_compression_activity_heartbeat_stops_on_compress_exception(tmp_path: Path) -> None:
+    """Exception paths must stop the heartbeat and release the compression lock."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "HEARTBEAT_FAIL_TEST"
+    db.create_session(session_id, source="wecom")
+
+    agent = _build_agent_with_db(db, session_id)
+    agent._compression_activity_heartbeat_interval = 0.05
+    touch_calls: list[str] = []
+    agent._touch_activity = lambda desc: touch_calls.append(desc)
+
+    def _failing_compress(*_a, **_kw):
+        time.sleep(0.12)
+        raise RuntimeError("compress boom")
+
+    agent.context_compressor.compress.side_effect = _failing_compress
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+    with pytest.raises(RuntimeError, match="compress boom"):
+        agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+    assert touch_calls[0] == "context compression started"
+    assert "context compression in progress" in touch_calls
+    assert touch_calls[-1] == "context compression failed"
+    assert db.get_compression_lock_holder(session_id) is None
+
+
 def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     """Two AIAgents that share a session_id MUST NOT both rotate it.
 

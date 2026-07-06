@@ -1752,6 +1752,18 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
 
+## Recovery Index
+[Operational recovery anchors for continuing after compaction — include:
+- Worklog/checkpoint paths that should be read first
+- Relevant skills by name
+- Repo/workdir paths and current branches
+- Credential locations only, with values redacted; explicitly note when credentials exist locally but values are not preserved
+- Hosts/domains/IPs that matter
+- Current artifacts/deployments and rollback artifacts
+- Last verified state and exact evidence
+- Exact next action
+- Do-not-assume notes that would prevent false conclusions]
+
 Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
